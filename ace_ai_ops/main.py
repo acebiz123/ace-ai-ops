@@ -1,9 +1,13 @@
-import os, json, datetime as dt
+import os, json, datetime as dt, asyncio, logging
 from typing import Any, Dict, List, Optional
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -14,6 +18,57 @@ TBL_NOTES = os.getenv("AIRTABLE_TABLE_NOTES", "AI Notes")
 TBL_PROFILES = os.getenv("AIRTABLE_TABLE_PROFILES", "Profiles")
 
 AGENT_SHARED_SECRET = os.getenv("AGENT_SHARED_SECRET", "")
+
+# Connection pool settings
+MAX_RETRIES = 3
+RETRY_BACKOFF = [1, 2, 4]  # seconds
+
+# Global HTTP client (initialized on startup)
+http_client: Optional[httpx.AsyncClient] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage HTTP client lifecycle for connection pooling."""
+    global http_client
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(90.0, connect=10.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20)
+    )
+    logger.info("HTTP client initialized with connection pooling")
+    yield
+    await http_client.aclose()
+    logger.info("HTTP client closed")
+
+async def request_with_retry(method: str, url: str, **kwargs) -> httpx.Response:
+    """Make HTTP request with retry logic for transient failures."""
+    last_exception = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            if method == "GET":
+                response = await http_client.get(url, **kwargs)
+            else:
+                response = await http_client.post(url, **kwargs)
+            response.raise_for_status()
+            return response
+        except httpx.TimeoutException as e:
+            last_exception = e
+            logger.warning(f"Timeout on attempt {attempt + 1}/{MAX_RETRIES} for {url}")
+        except httpx.ConnectError as e:
+            last_exception = e
+            logger.warning(f"Connection error on attempt {attempt + 1}/{MAX_RETRIES} for {url}: {e}")
+        except httpx.HTTPStatusError as e:
+            # Don't retry on 4xx client errors (except 429 rate limit)
+            if e.response.status_code < 500 and e.response.status_code != 429:
+                logger.error(f"HTTP error {e.response.status_code} for {url}: {e.response.text}")
+                raise HTTPException(status_code=502, detail=f"External API error: {e.response.status_code}")
+            last_exception = e
+            logger.warning(f"HTTP {e.response.status_code} on attempt {attempt + 1}/{MAX_RETRIES} for {url}")
+
+        if attempt < MAX_RETRIES - 1:
+            await asyncio.sleep(RETRY_BACKOFF[attempt])
+
+    logger.error(f"All {MAX_RETRIES} attempts failed for {url}")
+    raise HTTPException(status_code=503, detail=f"Service unavailable after {MAX_RETRIES} retries")
 
 def guard_secret(x_agent_key: Optional[str]) -> None:
     if AGENT_SHARED_SECRET and x_agent_key != AGENT_SHARED_SECRET:
@@ -34,36 +89,30 @@ async def airtable_find_profile(profile_key: str) -> Optional[Dict[str, Any]]:
     formula = f"{{Profile Key}}='{profile_key}'"
     params = {"filterByFormula": formula, "maxRecords": 1}
     headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(airtable_url(TBL_PROFILES), params=params, headers=headers)
-        r.raise_for_status()
-        recs = r.json().get("records", [])
-        return recs[0] if recs else None
+    r = await request_with_retry("GET", airtable_url(TBL_PROFILES), params=params, headers=headers)
+    recs = r.json().get("records", [])
+    return recs[0] if recs else None
 
 async def airtable_create_note(fields: Dict[str, Any]) -> None:
     headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
     payload = {"fields": fields}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(airtable_url(TBL_NOTES), headers=headers, json=payload)
-        r.raise_for_status()
+    await request_with_retry("POST", airtable_url(TBL_NOTES), headers=headers, json=payload)
 
 async def openai_json(system: str, user_obj: Dict[str, Any]) -> Dict[str, Any]:
-    url = "https://api.openai.com/v1/responses"
+    url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": OPENAI_MODEL,
-        "input": [
+        "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user_obj)},
         ],
-        "text": {"format": {"type": "json_object"}}
+        "response_format": {"type": "json_object"}
     }
-    async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        out = r.json()
-        text = out["output"][0]["content"][0]["text"]
-        return json.loads(text)
+    r = await request_with_retry("POST", url, headers=headers, json=payload)
+    out = r.json()
+    text = out["choices"][0]["message"]["content"]
+    return json.loads(text)
 
 SYS_INSIGHTS = "You are the Insights Agent. Return JSON only."
 SYS_STRATEGY = "You are the Strategy Agent. Return JSON only."
@@ -72,7 +121,7 @@ SYS_REVENUE = "You are the Revenue Agent. Return JSON only."
 SYS_OPS = "You are the Ops Agent. Return JSON only."
 SYS_CEO = "You are the CEO Copilot. Return JSON with keys: answer, recommended_actions, risks_alerts."
 
-app = FastAPI(title="Ace AI Ops Agent Server", version="0.1.0")
+app = FastAPI(title="Ace AI Ops Agent Server", version="0.1.0", lifespan=lifespan)
 
 class BlowupEvent(BaseModel):
     profile_key: str
