@@ -1,0 +1,20 @@
+{
+  "question": "What are the top 3 leverage moves today?",
+  "context": {
+    "blowups": [
+      {
+        "profile_key": "TT:ruby_ai",
+        "views": 312000
+      }
+    ],
+    "missed_profiles": [
+      {
+        "profile_key": "IG:foo",
+        "hours": 28
+      }
+    ],
+    "revenue": {
+      "today": 4230
+    }
+  }
+}

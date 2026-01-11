@@ -1,0 +1,17 @@
+{
+  "profile_key": "TT:ruby_ai",
+  "platform": "TikTok",
+  "handle": "ruby_ai",
+  "hook_text": "POV: ...",
+  "media_type": "video",
+  "metrics": {
+    "views": 312000,
+    "likes": 21000,
+    "shares": 3400,
+    "comments": 1200
+  },
+  "baseline": {
+    "avg_views_7d": 100000,
+    "avg_views_24h": 90000
+  }
+}
