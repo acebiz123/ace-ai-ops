@@ -48,21 +48,21 @@ async def airtable_create_note(fields: Dict[str, Any]) -> None:
         r.raise_for_status()
 
 async def openai_json(system: str, user_obj: Dict[str, Any]) -> Dict[str, Any]:
-    url = "https://api.openai.com/v1/responses"
+    url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": OPENAI_MODEL,
-        "input": [
+        "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user_obj)},
         ],
-        "text": {"format": {"type": "json_object"}}
+        "response_format": {"type": "json_object"}
     }
     async with httpx.AsyncClient(timeout=90) as client:
         r = await client.post(url, headers=headers, json=payload)
         r.raise_for_status()
         out = r.json()
-        text = out["output"][0]["content"][0]["text"]
+        text = out["choices"][0]["message"]["content"]
         return json.loads(text)
 
 SYS_INSIGHTS = "You are the Insights Agent. Return JSON only."
